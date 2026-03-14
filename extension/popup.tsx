@@ -108,13 +108,13 @@ function appendContextDebug(result: AgentResponse): void {
   chatEl.scrollTop = chatEl.scrollHeight;
 }
 
-function getCurrentTab(): Promise<{ id?: number }> {
+function getCurrentTab(): Promise<{ id?: number; url?: string }> {
   if (!hasChromeRuntime) {
     return Promise.reject(new Error("Preview mode does not have browser tab access"));
   }
 
   return new Promise((resolve, reject) => {
-    chrome.tabs.query({ active: true, currentWindow: true }, (tabs: Array<{ id?: number }>) => {
+    chrome.tabs.query({ active: true, currentWindow: true }, (tabs: Array<{ id?: number; url?: string }>) => {
       const tab = tabs[0];
       if (!tab?.id) {
         reject(new Error("No active tab found"));
@@ -135,10 +135,53 @@ function requestPageContext(tabId: number): Promise<WebPageContext> {
     });
   }
 
+  const extractViaScripting = (): Promise<WebPageContext> => {
+    return new Promise((resolve, reject) => {
+      chrome.scripting.executeScript(
+        {
+          target: { tabId },
+          func: () => {
+            const text = (document.body?.innerText || "").slice(0, 10000);
+            const images = Array.from(document.querySelectorAll("img"))
+              .map((img) => (img as HTMLImageElement).src || "")
+              .filter(Boolean)
+              .slice(0, 5);
+
+            return {
+              url: window.location.href,
+              title: document.title,
+              text,
+              images
+            };
+          }
+        },
+        (results: Array<{ result?: WebPageContext }>) => {
+          if (chrome.runtime.lastError) {
+            reject(new Error(chrome.runtime.lastError.message));
+            return;
+          }
+
+          const context = results?.[0]?.result;
+          if (!context) {
+            reject(new Error("Failed to capture page context"));
+            return;
+          }
+
+          resolve(context);
+        }
+      );
+    });
+  };
+
   return new Promise((resolve, reject) => {
     chrome.tabs.sendMessage(tabId, { type: "GET_PAGE_CONTEXT" }, (response: { context?: WebPageContext }) => {
       if (chrome.runtime.lastError) {
-        reject(new Error(chrome.runtime.lastError.message));
+        // Most common cause: content script not injected (tab opened before extension install/reload)
+        // or the page does not allow content scripts. Try a scripting fallback.
+        extractViaScripting().then(resolve).catch((err) => {
+          const reason = chrome.runtime.lastError?.message || "No receiver in tab";
+          reject(new Error(`${reason}. Fallback failed: ${err instanceof Error ? err.message : String(err)}`));
+        });
         return;
       }
 
