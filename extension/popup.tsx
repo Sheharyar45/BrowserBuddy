@@ -1,8 +1,22 @@
+import { createCandidate, resolveSelectedCandidate, type CandidateProduct } from "./selection_utils";
+
 type WebPageContext = {
   url: string;
   title: string;
   text: string;
   images: string[];
+  candidate_products: CandidateProduct[];
+  selected_candidate: CandidateProduct | null;
+};
+
+type RawScriptingContext = {
+  url: string;
+  title: string;
+  text: string;
+  images: string[];
+  candidate_products_raw: Array<{ src: string; alt_text: string }>;
+  selected_candidate_raw: { src: string; alt_text: string } | null;
+  selection_text: string;
 };
 
 type AgentResponse = {
@@ -61,6 +75,7 @@ const promptEl = document.getElementById("prompt") as HTMLTextAreaElement;
 const sendBtn = document.getElementById("send") as HTMLButtonElement;
 const viewContextBtn = document.getElementById("viewContext") as HTMLButtonElement;
 let lastSessionId: string | null = null;
+let lastTabUrl: string | null = null;
 
 function escapeHtml(text: string): string {
   return text
@@ -143,7 +158,11 @@ function requestPageContext(tabId: number): Promise<WebPageContext> {
       url: "https://example.com/sweater",
       title: "Demo Sweater Product Page",
       text: "This is a demo context used in popup preview mode.",
-      images: ["https://picsum.photos/300/300"]
+      images: ["https://picsum.photos/300/300"],
+      candidate_products: [
+        { image: "https://picsum.photos/300/300", alt_text: "Demo sweater" },
+      ],
+      selected_candidate: { image: "https://picsum.photos/300/300", alt_text: "Demo sweater" },
     });
   }
 
@@ -154,32 +173,91 @@ function requestPageContext(tabId: number): Promise<WebPageContext> {
           target: { tabId },
           func: () => {
             const text = (document.body?.innerText || "").slice(0, 10000);
-            const images = Array.from(document.querySelectorAll("img"))
+            const imageElements = Array.from(document.querySelectorAll("img"));
+
+            const images = imageElements
               .map((img) => (img as HTMLImageElement).src || "")
               .filter(Boolean)
-              .slice(0, 5);
+              .slice(0, 50);
+
+            const candidate_products_raw = imageElements
+              .map((img) => {
+                const element = img as HTMLImageElement;
+                const src = element.src || "";
+                if (!src) {
+                  return null;
+                }
+
+                const alt_text =
+                  (element.getAttribute("alt") ||
+                    element.getAttribute("aria-label") ||
+                    element.getAttribute("title") ||
+                    "").trim() || "Unnamed product";
+
+                return { src, alt_text };
+              })
+              .filter(Boolean)
+              .slice(0, 50) as Array<{ src: string; alt_text: string }>;
+
+            const selection_text = (window.getSelection?.()?.toString() || "").trim();
+            let selected_candidate_raw: { src: string; alt_text: string } | null = null;
+
+            // If user clicked a product in an injected content script, honor that marker.
+            if (!selected_candidate_raw) {
+              const marked = document.querySelector('img[data-browserbuddy-selected-candidate="1"]') as HTMLImageElement | null;
+              if (marked?.src) {
+                selected_candidate_raw = {
+                  src: marked.src,
+                  alt_text: (marked.getAttribute("alt") || marked.getAttribute("aria-label") || marked.getAttribute("title") || "").trim() || "Unnamed product",
+                };
+              }
+            }
 
             return {
               url: window.location.href,
               title: document.title,
               text,
-              images
+              images,
+              candidate_products_raw,
+              selected_candidate_raw,
+              selection_text,
             };
           }
         },
-        (results: Array<{ result?: WebPageContext }>) => {
+        (results: Array<{ result?: RawScriptingContext }>) => {
           if (chrome.runtime.lastError) {
             reject(new Error(chrome.runtime.lastError.message));
             return;
           }
 
-          const context = results?.[0]?.result;
-          if (!context) {
+          const raw = results?.[0]?.result;
+          if (!raw) {
             reject(new Error("Failed to capture page context"));
             return;
           }
 
-          resolve(context);
+          const candidate_products = raw.candidate_products_raw
+            .map((item) => createCandidate(item.src, item.alt_text, raw.url))
+            .filter((item): item is CandidateProduct => Boolean(item));
+
+          const explicitSelected = raw.selected_candidate_raw
+            ? createCandidate(raw.selected_candidate_raw.src, raw.selected_candidate_raw.alt_text, raw.url)
+            : null;
+
+          const selected_candidate = resolveSelectedCandidate(
+            candidate_products,
+            explicitSelected,
+            raw.selection_text || ""
+          );
+
+          resolve({
+            url: raw.url,
+            title: raw.title,
+            text: raw.text,
+            images: raw.images,
+            candidate_products,
+            selected_candidate,
+          });
         }
       );
     });
@@ -207,10 +285,12 @@ function requestPageContext(tabId: number): Promise<WebPageContext> {
   });
 }
 
-function queryAgent(prompt: string, context: WebPageContext): Promise<AgentResponse> {
+function queryAgent(payload: { prompt: string; context?: WebPageContext; session_id?: string }): Promise<AgentResponse> {
   if (!hasChromeRuntime) {
+    const contextTitle = payload.context?.title || "(no context)";
     return Promise.resolve({
-      response: `Preview response for: "${prompt}" on page "${context.title}"`
+      session_id: payload.session_id,
+      response: `Preview response for: "${payload.prompt}" on page "${contextTitle}"`
     });
   }
 
@@ -218,7 +298,7 @@ function queryAgent(prompt: string, context: WebPageContext): Promise<AgentRespo
     chrome.runtime.sendMessage(
       {
         type: "AGENT_QUERY",
-        payload: { prompt, context }
+        payload
       },
       (response: { ok?: boolean; error?: string; data?: AgentResponse }) => {
         if (chrome.runtime.lastError) {
@@ -245,7 +325,11 @@ function getStoredContext(sessionId: string): Promise<StoredContextResponse> {
         url: "https://example.com/sweater",
         title: "Demo Sweater Product Page",
         text: "Preview mode mock stored context.",
-        images: ["https://picsum.photos/300/300"]
+        images: ["https://picsum.photos/300/300"],
+        candidate_products: [
+          { image: "https://picsum.photos/300/300", alt_text: "Demo sweater" },
+        ],
+        selected_candidate: { image: "https://picsum.photos/300/300", alt_text: "Demo sweater" },
       }
     });
   }
@@ -280,6 +364,17 @@ appendMessage(
     : "Running in preview mode. API calls are mocked."
 );
 
+function shouldRefreshContextForPrompt(prompt: string): boolean {
+  const p = prompt.trim().toLowerCase();
+  if (!p) {
+    return false;
+  }
+
+  // Refresh context when user likely asks for product/similarity actions,
+  // so new mouse-selected candidate reaches backend even in existing session.
+  return /(cheaper|price|buy|purchase|shop|deal|discount|alternative|similar|like this|match|same style|find this)/i.test(p);
+}
+
 sendBtn.addEventListener("click", async () => {
   const prompt = promptEl.value.trim();
   if (!prompt) {
@@ -292,9 +387,24 @@ sendBtn.addEventListener("click", async () => {
 
   try {
     const tab = await getCurrentTab();
-    const context = await requestPageContext(tab.id as number);
-    const result = await queryAgent(prompt, context);
+    const tabUrl = tab.url || null;
+
+    // If the user navigated to a different page while the popup is open,
+    // start a fresh session so we don't reuse the wrong stored context.
+    if (lastSessionId && lastTabUrl && tabUrl && tabUrl !== lastTabUrl) {
+      lastSessionId = null;
+    }
+
+    let result: AgentResponse;
+    if (lastSessionId && !shouldRefreshContextForPrompt(prompt)) {
+      result = await queryAgent({ prompt, session_id: lastSessionId });
+    } else {
+      const context = await requestPageContext(tab.id as number);
+      result = await queryAgent({ prompt, context, session_id: lastSessionId || undefined });
+    }
+
     lastSessionId = result.session_id || null;
+    lastTabUrl = tabUrl;
 
     // Show tool badges if available
     if (result.tools_used && result.tools_used.length > 0) {

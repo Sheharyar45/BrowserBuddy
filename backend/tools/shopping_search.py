@@ -69,7 +69,7 @@ DEMO_RESULTS: list[dict[str, str]] = [
 # ---------------------------------------------------------------------------
 
 
-def _search_duckduckgo(query: str, max_results: int = 5) -> list[dict[str, str]]:
+def _search_duckduckgo(query: str, max_results: int = 10) -> list[dict[str, str]]:
     """Run a DuckDuckGo text search for shopping-oriented results."""
 
     if not HAS_DDGS or _DDGS_CLASS is None:
@@ -129,7 +129,7 @@ class ShoppingSearchTool(BaseTool):
                 ToolParameter(
                     name="max_results",
                     type="integer",
-                    description="Maximum number of results to return (default 5).",
+                    description="Maximum number of results to return (default 10).",
                     required=False,
                 ),
             ],
@@ -137,7 +137,7 @@ class ShoppingSearchTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         query: str = kwargs.get("query", "")
-        max_results: int = kwargs.get("max_results", 5)
+        max_results: int = kwargs.get("max_results", 10)
 
         if not query or not query.strip():
             return {"error": "No search query provided."}

@@ -137,7 +137,7 @@ async def _llm_generate(task: str, page_text: str) -> str | None:
         },
     ]
 
-    return await llm_chat(messages, max_tokens=1024, temperature=0.5)
+    return await llm_chat(messages, max_tokens=2048, temperature=0.5)
 
 
 # ---------------------------------------------------------------------------

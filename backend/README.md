@@ -5,10 +5,10 @@ This backend now supports the first MVP requirement: reliably receiving and stor
 ## Implemented
 
 - `POST /agent/query`
-  - Accepts: `prompt`, `context`
+  - Accepts: `prompt` and either `context` (first request) or `session_id` (subsequent requests)
   - `context` includes: `url`, `title`, `text`, `images`
-  - Validates context is not empty
-  - Stores context in memory by `session_id`
+  - Validates context is not empty (when provided)
+  - Stores context by `session_id` and allows reusing it without resending
   - Returns context receipt summary (`text_chars`, `image_count`, `first_image`)
 
 - `GET /context/{session_id}`
@@ -92,5 +92,14 @@ Server should show:
     "text": "Product details and description...",
     "images": ["https://.../image1.jpg", "https://.../image2.jpg"]
   }
+}
+```
+
+After the first request returns a `session_id`, you can send subsequent queries without resending page text:
+
+```json
+{
+  "prompt": "Summarize in one sentence",
+  "session_id": "<session-id-from-first-response>"
 }
 ```

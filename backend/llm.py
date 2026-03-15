@@ -38,7 +38,7 @@ HF_API_KEY = os.environ.get("HF_API_KEY", "")  # empty = no auth needed for this
 
 # Fallback: Gemini
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.0-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 # Timeout for LLM calls (seconds)
 LLM_TIMEOUT = int(os.environ.get("LLM_TIMEOUT", "60"))
