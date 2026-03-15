@@ -294,7 +294,13 @@ def _keyword_route(prompt: str, context: dict[str, Any]) -> list[dict[str, Any]]
 
     if _kw_match(p, _SEARCH_KW):
         title = context.get("title", "")
-        plan.append({"tool": "shopping_search", "params": {"query": title or prompt, "max_results": 5}})
+        images = context.get("images", [])
+        plan.append({"tool": "shopping_search", "params": {
+            "query": title or prompt,
+            "image_url": images[0] if images else "",
+            "user_intent": prompt,
+            "max_results": 5,
+        }})
 
     if _kw_match(p, _GENERATE_KW):
         plan.append({"tool": "generate_content", "params": {"task": prompt, "page_text": context.get("text", "")}})
@@ -339,7 +345,11 @@ def _format_response(tools_used: list[str], results: list[dict[str, Any]]) -> st
             query = result.get("query", "")
             items = result.get("results", [])
             note = result.get("note", "")
-            text = f'🛒 Shopping Results for "{query}"'
+            vision = result.get("vision_enhanced", False)
+            label = "🛒 Shopping Results"
+            if vision:
+                label += " (Vision Enhanced)"
+            text = f'{label} for "{query}"'
             if not items:
                 text += "\n\nNo results found."
             for i, item in enumerate(items, 1):
@@ -473,7 +483,7 @@ async def run_agent(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         routing_method = "keyword"
 
     # Pre-execution disambiguation for product/image tools
-    needs_product_selection = any(
+    needs_product_selection = False and any(
         step.get("tool") in {"shopping_search", "image_similarity"}
         for step in plan
     )

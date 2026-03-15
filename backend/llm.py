@@ -276,3 +276,145 @@ async def llm_json(
 
     logger.warning("Failed to parse LLM response as JSON after retry — raw: %s", retry_text[:240])
     return None
+
+
+# ---------------------------------------------------------------------------
+# Shared image utilities (used by candidate_selection, shopping_search, etc.)
+# ---------------------------------------------------------------------------
+
+_MAX_IMAGE_BYTES = 3 * 1024 * 1024
+
+
+_DOWNLOAD_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+}
+
+
+async def download_image(
+    url: str, max_bytes: int = _MAX_IMAGE_BYTES
+) -> tuple[bytes, str] | None:
+    """Download an image.  Returns ``(raw_bytes, mime_type)`` or *None*."""
+    try:
+        async with httpx.AsyncClient(
+            timeout=30, follow_redirects=True, headers=_DOWNLOAD_HEADERS
+        ) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            ct = resp.headers.get("content-type", "image/jpeg")
+            if not ct.startswith("image/"):
+                return None
+            body = resp.content
+            if len(body) > max_bytes:
+                logger.warning("Image too large (%d bytes), skipping", len(body))
+                return None
+            return body, ct
+    except Exception as exc:
+        logger.debug("Image download failed %s: %s", url[:100], exc)
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Gemini Vision (multimodal) — text + images
+# ---------------------------------------------------------------------------
+
+
+async def gemini_vision(
+    text_prompt: str,
+    image_parts: list[dict[str, str]],
+    system_prompt: str = "",
+    max_tokens: int = 2048,
+    temperature: float = 0.2,
+) -> str | None:
+    """Call Gemini with text **and** inline images (multimodal).
+
+    *image_parts* is a list of ``{"mime_type": "image/jpeg", "data": "<base64>"}``
+    dicts.  Returns the raw text response or *None*.
+    """
+    if not GEMINI_API_KEY:
+        logger.warning("GEMINI_API_KEY not set — cannot call Gemini Vision")
+        return None
+
+    endpoint = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    parts: list[dict[str, Any]] = [{"text": text_prompt}]
+    for img in image_parts:
+        parts.append(
+            {"inlineData": {"mimeType": img["mime_type"], "data": img["data"]}}
+        )
+
+    payload: dict[str, Any] = {
+        "contents": [{"role": "user", "parts": parts}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens,
+            "temperature": temperature,
+        },
+    }
+    if system_prompt:
+        payload["systemInstruction"] = {"parts": [{"text": system_prompt}]}
+
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+            resp = await client.post(endpoint, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip code fences
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = [ln for ln in lines if not ln.strip().startswith("```")]
+            raw = "\n".join(lines).strip()
+        return raw
+
+    except Exception as exc:
+        logger.warning("Gemini Vision call failed: %s", exc)
+        return None
+
+
+async def gemini_vision_json(
+    text_prompt: str,
+    image_parts: list[dict[str, str]],
+    system_prompt: str = "",
+    max_tokens: int = 512,
+    temperature: float = 0.1,
+) -> Any | None:
+    """Like :func:`gemini_vision` but parses the response as JSON."""
+    raw = await gemini_vision(
+        text_prompt, image_parts, system_prompt, max_tokens, temperature
+    )
+    if raw is None:
+        return None
+
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        pass
+
+    # Try extracting a JSON object from mixed prose
+    match = re.search(r"\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}", raw)
+    if match:
+        try:
+            return json.loads(match.group())
+        except json.JSONDecodeError:
+            pass
+
+    # Try to recover truncated JSON (Gemini thinking may consume tokens)
+    trunc = re.search(r'\{[^{}]*$', raw)
+    if trunc:
+        fragment = trunc.group()
+        # Extract key-value pairs from truncated object
+        pairs = re.findall(r'"(\w+)"\s*:\s*"([^"]+)"', fragment)
+        if pairs:
+            recovered = {k: v for k, v in pairs}
+            logger.info("gemini_vision_json: recovered partial JSON: %s", recovered)
+            return recovered
+
+    logger.warning("gemini_vision_json: could not parse: %s", raw[:200])
+    return None

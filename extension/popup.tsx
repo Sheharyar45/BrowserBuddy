@@ -38,6 +38,7 @@ type AgentResponse = {
   response: string;
   tools_used?: string[];
   tool_results?: any[];
+  routing_method?: string;
 };
 
 type StoredContextResponse = {
@@ -399,6 +400,23 @@ function hideLoading(): void {
   }
 }
 
+const TOOL_DISPLAY_NAMES: Record<string, { label: string; icon: string; color: string; bg: string }> = {
+  summarize_page: { label: "Summarize", icon: "\uD83D\uDCDD", color: "#0369a1", bg: "#e0f2fe" },
+  shopping_search: { label: "Shopping Search", icon: "\uD83D\uDED2", color: "#7c3aed", bg: "#ede9fe" },
+  image_similarity: { label: "Image Similarity", icon: "\uD83D\uDD0D", color: "#0d9488", bg: "#ccfbf1" },
+  generate_content: { label: "Content Generator", icon: "\u270D\uFE0F", color: "#c2410c", bg: "#fff7ed" },
+};
+
+function toolBadgeHtml(toolName: string): string {
+  const info = TOOL_DISPLAY_NAMES[toolName];
+  if (!info) return "";
+  return (
+    `<span style="display:inline-block;font-size:10px;font-weight:600;color:${info.color};` +
+    `background:${info.bg};padding:2px 8px;border-radius:6px;margin-left:6px;vertical-align:middle;">` +
+    `${info.icon} ${info.label}</span>`
+  );
+}
+
 function appendToolCard(toolName: string, data: any): void {
   if (!data) return;
   if (data?.error && !data?.results?.length) {
@@ -414,7 +432,7 @@ function appendToolCard(toolName: string, data: any): void {
   if (toolName === "image_similarity") {
     const identified = data.identified_item || "Similar Items";
     const method = data.method || "";
-    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDD0D ${escapeHtml(identified)}`;
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDD0D ${escapeHtml(identified)}${toolBadgeHtml(toolName)}`;
     if (method)
       html += ` <span style="font-size:10px;font-weight:400;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px;">${escapeHtml(method)}</span>`;
     html += `</div>`;
@@ -437,7 +455,11 @@ function appendToolCard(toolName: string, data: any): void {
 
   } else if (toolName === "shopping_search") {
     const query = data.query || "Products";
-    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDED2 ${escapeHtml(query)}</div>`;
+    const isVision = data.vision_enhanced;
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDED2 ${escapeHtml(query)}${toolBadgeHtml(toolName)}`;
+    if (isVision)
+      html += ` <span style="font-size:10px;font-weight:400;color:#7c3aed;background:#ede9fe;padding:2px 6px;border-radius:4px;">Vision Enhanced</span>`;
+    html += `</div>`;
     const items: any[] = data.results || [];
     if (!items.length) html += `<div style="color:#94a3b8;">No results found.</div>`;
     for (const item of items) {
@@ -459,7 +481,7 @@ function appendToolCard(toolName: string, data: any): void {
     const summary = data.summary || "";
     const keyPoints: string[] = data.key_points || [];
     const method = data.method || "";
-    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDCDD Summary`;
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDCDD Summary${toolBadgeHtml(toolName)}`;
     if (method)
       html += ` <span style="font-size:10px;font-weight:400;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px;">${escapeHtml(method)}</span>`;
     html += `</div>`;
@@ -475,7 +497,7 @@ function appendToolCard(toolName: string, data: any): void {
   } else if (toolName === "generate_content") {
     const content = data.content || "";
     const method = data.method || "";
-    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\u270D\uFE0F Generated`;
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\u270D\uFE0F Generated${toolBadgeHtml(toolName)}`;
     if (method)
       html += ` <span style="font-size:10px;font-weight:400;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px;">${escapeHtml(method)}</span>`;
     html += `</div>`;
@@ -548,6 +570,21 @@ sendBtn.addEventListener("click", async () => {
     if (hasCards) {
       const tools = result.tools_used!;
       const results = result.tool_results!;
+
+      // Show routing info banner
+      const routeInfo = document.createElement("div");
+      const toolLabels = tools
+        .map((t: string) => {
+          const info = TOOL_DISPLAY_NAMES[t];
+          return info ? `${info.icon} ${info.label}` : t;
+        })
+        .join(" → ");
+      routeInfo.style.cssText =
+        "margin-bottom:6px;padding:5px 10px;border-radius:8px;" +
+        "background:#f0f9ff;color:#0c4a6e;font-size:10px;font-weight:500;";
+      routeInfo.textContent = `Tool${tools.length > 1 ? "s" : ""} used: ${toolLabels}`;
+      chatEl.appendChild(routeInfo);
+
       for (let i = 0; i < tools.length; i++) {
         appendToolCard(tools[i], results[i]);
       }

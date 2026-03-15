@@ -6,15 +6,11 @@ Finds visually similar images, products, or places given an image URL.
 Strategy (waterfall — first success wins):
   1. **SerpApi Google Lens** (optional) — direct visual-match results.
      Requires ``SERPAPI_KEY`` in ``.env``.  Free tier: 100 searches / month.
-  2. **Gemini Vision** — download the image, send to Gemini 2 Flash
-     (multimodal), ask it to describe the image & produce a search query,
-     then find matches with DuckDuckGo.  Free tier: 1 500 req / day.
+  2. **Gemini Vision** — download the image, send to Gemini via the shared
+     multimodal helper, ask it to describe the image & produce a search
+     query, then find matches with DuckDuckGo.
   3. **Text-inference fallback** — use the page title / text and the LLM
      to *guess* what the image contains, then search DuckDuckGo.
-     Works even when both SerpApi and Gemini are unavailable.
-
-All three paths return the same unified result schema so the agent
-formatter does not need any changes.
 """
 
 from __future__ import annotations
@@ -29,9 +25,15 @@ import httpx
 from dotenv import load_dotenv
 
 from tools import BaseTool, ToolDefinition, ToolParameter, registry
-from llm import llm_json, llm_chat, GEMINI_API_KEY, GEMINI_MODEL, LLM_TIMEOUT
+from llm import (
+    llm_json,
+    llm_chat,
+    download_image,
+    gemini_vision_json,
+    GEMINI_API_KEY,
+    LLM_TIMEOUT,
+)
 
-# Reload .env so SERPAPI_KEY is picked up
 _env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
 load_dotenv(_env_path)
 
@@ -39,13 +41,11 @@ logger = logging.getLogger("browserbuddy.tools.image_similarity")
 
 SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
-# Max image payload to send to Gemini (4 MB base64 ≈ 3 MB raw)
-_MAX_IMAGE_BYTES = 3 * 1024 * 1024
-
 
 # =====================================================================
 # Strategy 1 — SerpApi Google Lens
 # =====================================================================
+
 
 async def _serpapi_lens(
     image_url: str,
@@ -76,9 +76,11 @@ async def _serpapi_lens(
                 "url": match.get("link", ""),
                 "image_url": match.get("thumbnail", ""),
                 "snippet": match.get("snippet", match.get("source", "")),
-                "price": match.get("price", {}).get("extracted_value", "")
-                         if isinstance(match.get("price"), dict)
-                         else str(match.get("price", "")),
+                "price": (
+                    match.get("price", {}).get("extracted_value", "")
+                    if isinstance(match.get("price"), dict)
+                    else str(match.get("price", ""))
+                ),
                 "source": "google_lens",
             })
 
@@ -93,7 +95,7 @@ async def _serpapi_lens(
 
 
 # =====================================================================
-# Strategy 2 — Gemini Vision  (describe → DDG search)
+# Strategy 2 — Gemini Vision (describe → DDG search)
 # =====================================================================
 
 _VISION_PROMPT = """\
@@ -105,82 +107,6 @@ Look at this image carefully.  Return ONLY a JSON object (no markdown, no explan
 }
 Important: the search_query should focus on the PRIMARY item name (e.g. "avocado toast" not "soft-boiled egg"), and be suitable for a shopping or restaurant search engine.
 """
-
-
-async def _download_image(url: str) -> tuple[bytes, str] | None:
-    """Download an image, respecting size limits.  Returns (bytes, mime) or None."""
-    try:
-        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            content_type = resp.headers.get("content-type", "image/jpeg")
-            if not content_type.startswith("image/"):
-                logger.warning("URL did not return an image: %s", content_type)
-                return None
-            body = resp.content
-            if len(body) > _MAX_IMAGE_BYTES:
-                logger.warning("Image too large (%d bytes), skipping Gemini vision", len(body))
-                return None
-            return body, content_type
-    except Exception as exc:
-        logger.warning("Failed to download image %s: %s", url[:120], exc)
-        return None
-
-
-async def _gemini_describe_image(
-    image_bytes: bytes,
-    mime_type: str,
-) -> dict[str, str] | None:
-    """Send the image to Gemini Vision and parse a JSON description."""
-
-    if not GEMINI_API_KEY:
-        return None
-
-    url = (
-        f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-    )
-
-    img_b64 = base64.b64encode(image_bytes).decode()
-
-    payload: dict[str, Any] = {
-        "contents": [{
-            "parts": [
-                {"text": _VISION_PROMPT},
-                {
-                    "inlineData": {
-                        "mimeType": mime_type,
-                        "data": img_b64,
-                    },
-                },
-            ],
-        }],
-        "generationConfig": {
-            "maxOutputTokens": 512,
-            "temperature": 0.1,
-        },
-    }
-
-    try:
-        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-
-        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
-        # Strip code fences if present
-        if raw.startswith("```"):
-            lines = raw.split("\n")
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            raw = "\n".join(lines).strip()
-
-        parsed = json.loads(raw)
-        logger.info("Gemini Vision identified: %s", parsed.get("item", "?"))
-        return parsed
-
-    except Exception as exc:
-        logger.warning("Gemini Vision failed: %s", exc)
-        return None
 
 
 async def _ddg_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
@@ -215,19 +141,29 @@ async def _gemini_vision_pipeline(
 ) -> tuple[list[dict[str, Any]], str] | None:
     """Gemini Vision → DDG pipeline.  Returns (results, identified_item) or None."""
 
-    downloaded = await _download_image(image_url)
+    downloaded = await download_image(image_url)
     if downloaded is None:
         return None
 
     image_bytes, mime = downloaded
-    description = await _gemini_describe_image(image_bytes, mime)
-    if description is None:
+    image_parts = [{
+        "mime_type": mime,
+        "data": base64.b64encode(image_bytes).decode(),
+    }]
+
+    description = await gemini_vision_json(
+        _VISION_PROMPT,
+        image_parts,
+        max_tokens=2048,
+        temperature=0.1,
+    )
+    if description is None or not isinstance(description, dict):
         return None
 
     item = description.get("item", "")
+    logger.info("Gemini Vision identified: %s", item)
 
-    # Build search query from user intent + identified item (more reliable
-    # than Gemini's search_query which sometimes focuses on wrong details).
+    # Build search query from user intent + identified item
     lower_q = user_query.lower()
     if "near me" in lower_q or "nearby" in lower_q:
         search_query = f"{item} restaurant near me"
@@ -238,7 +174,6 @@ async def _gemini_vision_pipeline(
     elif "similar" in lower_q or "like this" in lower_q:
         search_query = f"{item} similar alternatives"
     else:
-        # Fall back to Gemini's suggestion
         search_query = description.get("search_query", item)
 
     logger.info("Vision pipeline: item=%r, search_query=%r", item, search_query)
@@ -247,7 +182,7 @@ async def _gemini_vision_pipeline(
 
 
 # =====================================================================
-# Strategy 3 — Text-inference fallback  (page context → LLM → DDG)
+# Strategy 3 — Text-inference fallback (page context → LLM → DDG)
 # =====================================================================
 
 _INFER_PROMPT = """\
@@ -282,30 +217,24 @@ async def _text_inference_pipeline(
         },
     ]
 
-    # Try structured JSON first
+    import re as _re
+
     parsed = await llm_json(messages, max_tokens=200, temperature=0.1)
 
-    # If llm_json failed, try llm_chat and extract manually
     if not isinstance(parsed, dict) or "item" not in parsed:
         raw = await llm_chat(messages, max_tokens=300, temperature=0.1)
         if raw:
-            # Try to find JSON in the response
-            import re as _re
-            json_match = _re.search(r'\{[^}]+\}', raw)
+            json_match = _re.search(r"\{[^}]+\}", raw)
             if json_match:
                 try:
                     parsed = json.loads(json_match.group())
                 except json.JSONDecodeError:
                     parsed = None
 
-        # Last resort: use page title as item
         if not isinstance(parsed, dict) or "item" not in parsed:
             if page_title or page_text:
                 item_guess = page_title or page_text[:100]
-                parsed = {
-                    "item": item_guess,
-                    "search_query": f"{item_guess} buy",
-                }
+                parsed = {"item": item_guess, "search_query": f"{item_guess} buy"}
                 logger.info("Text inference fell back to page title: %s", item_guess)
             else:
                 return None
@@ -313,7 +242,6 @@ async def _text_inference_pipeline(
     item = parsed.get("item", "")
     search_query = parsed.get("search_query", item)
 
-    # Build intent-aware search query from identified item
     lower_q = user_query.lower()
     if "near me" in lower_q or "nearby" in lower_q:
         search_query = f"{item} restaurant near me"
