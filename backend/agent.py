@@ -210,7 +210,7 @@ def _build_router_user_message(prompt: str, context: dict[str, Any]) -> str:
 
     title = context.get("title", "")
     url = context.get("url", "")
-    text_preview = (context.get("text", "") or "")[:2000]
+    text_preview = (context.get("text", "") or "")[:4000]
     images = context.get("images", [])
     images_str = ", ".join(images[:3]) if images else "(none)"
 
@@ -218,7 +218,7 @@ def _build_router_user_message(prompt: str, context: dict[str, Any]) -> str:
         f"User prompt: {prompt}\n\n"
         f"Page title: {title}\n"
         f"Page URL: {url}\n"
-        f"Page text (first 2000 chars): {text_preview}\n"
+        f"Page text (first 4000 chars): {text_preview}\n"
         f"Page images: {images_str}"
     )
 
@@ -440,7 +440,7 @@ async def run_agent(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         routing_method = "keyword"
 
     # Pre-execution disambiguation for product/image tools
-    needs_product_selection = False and any(
+    needs_product_selection = any(
         step.get("tool") in {"shopping_search", "image_similarity"}
         for step in plan
     )
@@ -451,7 +451,11 @@ async def run_agent(prompt: str, context: dict[str, Any]) -> dict[str, Any]:
         is_ambiguous = False
 
         if selected_idx is None:
-            selected_idx, is_ambiguous, selection_reason = await select_candidate_from_prompt(prompt, candidates)
+            selected_idx, is_ambiguous, selection_reason = await select_candidate_from_prompt(
+                prompt,
+                candidates,
+                context=context,
+            )
 
         if is_ambiguous and len(candidates) > 1:
             logger.info("Ambiguous product selection. reason=%s", selection_reason)
