@@ -1,104 +1,374 @@
 """
 MCP Tool: image_similarity
 
-Finds visually similar images/products given an image URL.
+Finds visually similar images, products, or places given an image URL.
 
-MVP implementation uses a mock similarity engine.  When CLIP + a vector DB
-are available the mock can be swapped out transparently because the MCP
-interface stays the same.
+Strategy (waterfall — first success wins):
+  1. **SerpApi Google Lens** (optional) — direct visual-match results.
+     Requires ``SERPAPI_KEY`` in ``.env``.  Free tier: 100 searches / month.
+  2. **Gemini Vision** — download the image, send to Gemini 2 Flash
+     (multimodal), ask it to describe the image & produce a search query,
+     then find matches with DuckDuckGo.  Free tier: 1 500 req / day.
+  3. **Text-inference fallback** — use the page title / text and the LLM
+     to *guess* what the image contains, then search DuckDuckGo.
+     Works even when both SerpApi and Gemini are unavailable.
+
+All three paths return the same unified result schema so the agent
+formatter does not need any changes.
 """
 
 from __future__ import annotations
 
-import hashlib
+import base64
+import json
 import logging
+import os
 from typing import Any
 
+import httpx
+from dotenv import load_dotenv
+
 from tools import BaseTool, ToolDefinition, ToolParameter, registry
+from llm import llm_json, llm_chat, GEMINI_API_KEY, GEMINI_MODEL, LLM_TIMEOUT
+
+# Reload .env so SERPAPI_KEY is picked up
+_env_path = os.path.join(os.path.dirname(__file__), "..", ".env")
+load_dotenv(_env_path)
 
 logger = logging.getLogger("browserbuddy.tools.image_similarity")
 
+SERPAPI_KEY = os.environ.get("SERPAPI_KEY", "")
 
-# ---------------------------------------------------------------------------
-# Mock similarity engine (MVP)
-# ---------------------------------------------------------------------------
+# Max image payload to send to Gemini (4 MB base64 ≈ 3 MB raw)
+_MAX_IMAGE_BYTES = 3 * 1024 * 1024
 
 
-def _mock_similar_images(image_url: str, max_results: int = 5) -> list[dict[str, Any]]:
-    """Return deterministic mock results seeded by the image URL.
+# =====================================================================
+# Strategy 1 — SerpApi Google Lens
+# =====================================================================
 
-    In production this would:
-      1. Download the image
-      2. Generate a CLIP embedding
-      3. Search a vector database for nearest neighbours
-    """
+async def _serpapi_lens(
+    image_url: str,
+    max_results: int = 5,
+) -> list[dict[str, Any]] | None:
+    """Call SerpApi Google Lens.  Returns a list of visual matches or None."""
 
-    # Use hash of URL to create varied but deterministic demo results
-    url_hash = hashlib.md5(image_url.encode()).hexdigest()
-    seed = int(url_hash[:8], 16)
+    if not SERPAPI_KEY:
+        return None
 
-    mock_products = [
-        {
-            "title": "Classic Knit Pullover",
-            "url": "https://example.com/product/knit-pullover",
-            "image_url": "https://picsum.photos/seed/prod1/300/300",
-            "similarity": 0.94,
-            "price": "$32.00",
+    params: dict[str, Any] = {
+        "engine": "google_lens",
+        "url": image_url,
+        "api_key": SERPAPI_KEY,
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+            resp = await client.get("https://serpapi.com/search", params=params)
+            resp.raise_for_status()
+            data = resp.json()
+
+        visual_matches = data.get("visual_matches", [])
+        results: list[dict[str, Any]] = []
+        for match in visual_matches[:max_results]:
+            results.append({
+                "title": match.get("title", "Visual match"),
+                "url": match.get("link", ""),
+                "image_url": match.get("thumbnail", ""),
+                "snippet": match.get("snippet", match.get("source", "")),
+                "price": match.get("price", {}).get("extracted_value", "")
+                         if isinstance(match.get("price"), dict)
+                         else str(match.get("price", "")),
+                "source": "google_lens",
+            })
+
+        if results:
+            logger.info("SerpApi Google Lens returned %d visual matches", len(results))
+            return results
+
+    except Exception as exc:
+        logger.warning("SerpApi Google Lens failed: %s", exc)
+
+    return None
+
+
+# =====================================================================
+# Strategy 2 — Gemini Vision  (describe → DDG search)
+# =====================================================================
+
+_VISION_PROMPT = """\
+Look at this image carefully.  Return ONLY a JSON object (no markdown, no explanation):
+{
+  "item": "<what the image shows — e.g. avocado toast, red sneakers>",
+  "description": "<1-sentence visual description>",
+  "search_query": "<web search query to find this exact item for sale or on a menu — use the item name, not a generic category>"
+}
+Important: the search_query should focus on the PRIMARY item name (e.g. "avocado toast" not "soft-boiled egg"), and be suitable for a shopping or restaurant search engine.
+"""
+
+
+async def _download_image(url: str) -> tuple[bytes, str] | None:
+    """Download an image, respecting size limits.  Returns (bytes, mime) or None."""
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+            resp = await client.get(url)
+            resp.raise_for_status()
+            content_type = resp.headers.get("content-type", "image/jpeg")
+            if not content_type.startswith("image/"):
+                logger.warning("URL did not return an image: %s", content_type)
+                return None
+            body = resp.content
+            if len(body) > _MAX_IMAGE_BYTES:
+                logger.warning("Image too large (%d bytes), skipping Gemini vision", len(body))
+                return None
+            return body, content_type
+    except Exception as exc:
+        logger.warning("Failed to download image %s: %s", url[:120], exc)
+        return None
+
+
+async def _gemini_describe_image(
+    image_bytes: bytes,
+    mime_type: str,
+) -> dict[str, str] | None:
+    """Send the image to Gemini Vision and parse a JSON description."""
+
+    if not GEMINI_API_KEY:
+        return None
+
+    url = (
+        f"https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
+    )
+
+    img_b64 = base64.b64encode(image_bytes).decode()
+
+    payload: dict[str, Any] = {
+        "contents": [{
+            "parts": [
+                {"text": _VISION_PROMPT},
+                {
+                    "inlineData": {
+                        "mimeType": mime_type,
+                        "data": img_b64,
+                    },
+                },
+            ],
+        }],
+        "generationConfig": {
+            "maxOutputTokens": 512,
+            "temperature": 0.1,
         },
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=LLM_TIMEOUT) as client:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+
+        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Strip code fences if present
+        if raw.startswith("```"):
+            lines = raw.split("\n")
+            lines = [l for l in lines if not l.strip().startswith("```")]
+            raw = "\n".join(lines).strip()
+
+        parsed = json.loads(raw)
+        logger.info("Gemini Vision identified: %s", parsed.get("item", "?"))
+        return parsed
+
+    except Exception as exc:
+        logger.warning("Gemini Vision failed: %s", exc)
+        return None
+
+
+async def _ddg_search(query: str, max_results: int = 5) -> list[dict[str, Any]]:
+    """Run a DuckDuckGo web search and return simplified results."""
+    try:
+        from ddgs import DDGS  # type: ignore[import-untyped]
+        ddgs = DDGS()
+        raw = ddgs.text(query, max_results=max_results + 2)
+        results: list[dict[str, Any]] = []
+        for r in raw:
+            title = r.get("title", "")
+            if not title:
+                continue
+            results.append({
+                "title": title,
+                "url": r.get("href", r.get("link", "")),
+                "snippet": r.get("body", r.get("snippet", "")),
+                "source": "duckduckgo",
+            })
+            if len(results) >= max_results:
+                break
+        return results
+    except Exception as exc:
+        logger.warning("DDG search failed: %s", exc)
+        return []
+
+
+async def _gemini_vision_pipeline(
+    image_url: str,
+    user_query: str,
+    max_results: int = 5,
+) -> tuple[list[dict[str, Any]], str] | None:
+    """Gemini Vision → DDG pipeline.  Returns (results, identified_item) or None."""
+
+    downloaded = await _download_image(image_url)
+    if downloaded is None:
+        return None
+
+    image_bytes, mime = downloaded
+    description = await _gemini_describe_image(image_bytes, mime)
+    if description is None:
+        return None
+
+    item = description.get("item", "")
+
+    # Build search query from user intent + identified item (more reliable
+    # than Gemini's search_query which sometimes focuses on wrong details).
+    lower_q = user_query.lower()
+    if "near me" in lower_q or "nearby" in lower_q:
+        search_query = f"{item} restaurant near me"
+    elif "near" in lower_q:
+        search_query = f"{item} near me"
+    elif "cheap" in lower_q or "price" in lower_q or "buy" in lower_q:
+        search_query = f"{item} buy price"
+    elif "similar" in lower_q or "like this" in lower_q:
+        search_query = f"{item} similar alternatives"
+    else:
+        # Fall back to Gemini's suggestion
+        search_query = description.get("search_query", item)
+
+    logger.info("Vision pipeline: item=%r, search_query=%r", item, search_query)
+    results = await _ddg_search(search_query, max_results)
+    return (results, item) if results else None
+
+
+# =====================================================================
+# Strategy 3 — Text-inference fallback  (page context → LLM → DDG)
+# =====================================================================
+
+_INFER_PROMPT = """\
+You are a helpful assistant.  The user is viewing a webpage and looking
+at an image on that page.  Based on the page title and text, infer what
+the image most likely depicts.
+
+You MUST reply with ONLY a raw JSON object — no explanation, no markdown:
+{"item": "<what the image shows>", "search_query": "<web search query to find this item>"}
+"""
+
+
+async def _text_inference_pipeline(
+    image_url: str,
+    user_query: str,
+    page_text: str,
+    page_title: str,
+    max_results: int = 5,
+) -> tuple[list[dict[str, Any]], str] | None:
+    """Use the LLM (text-only) to guess what the image is, then DDG search."""
+
+    messages = [
+        {"role": "system", "content": _INFER_PROMPT},
         {
-            "title": "Ribbed Cotton Sweater",
-            "url": "https://example.com/product/ribbed-sweater",
-            "image_url": "https://picsum.photos/seed/prod2/300/300",
-            "similarity": 0.89,
-            "price": "$27.50",
-        },
-        {
-            "title": "Oversized Wool Cardigan",
-            "url": "https://example.com/product/wool-cardigan",
-            "image_url": "https://picsum.photos/seed/prod3/300/300",
-            "similarity": 0.85,
-            "price": "$45.00",
-        },
-        {
-            "title": "Cashmere Blend V-Neck",
-            "url": "https://example.com/product/cashmere-vneck",
-            "image_url": "https://picsum.photos/seed/prod4/300/300",
-            "similarity": 0.82,
-            "price": "$55.00",
-        },
-        {
-            "title": "Lightweight Crew Neck",
-            "url": "https://example.com/product/crew-neck",
-            "image_url": "https://picsum.photos/seed/prod5/300/300",
-            "similarity": 0.78,
-            "price": "$22.99",
+            "role": "user",
+            "content": (
+                f"User's request: {user_query}\n"
+                f"Page title: {page_title}\n"
+                f"Image URL: {image_url}\n"
+                f"Page text (first 1500 chars): {page_text[:1500]}"
+            ),
         },
     ]
 
-    # Rotate results based on seed for variety
-    offset = seed % len(mock_products)
-    rotated = mock_products[offset:] + mock_products[:offset]
-    return rotated[:max_results]
+    # Try structured JSON first
+    parsed = await llm_json(messages, max_tokens=200, temperature=0.1)
+
+    # If llm_json failed, try llm_chat and extract manually
+    if not isinstance(parsed, dict) or "item" not in parsed:
+        raw = await llm_chat(messages, max_tokens=300, temperature=0.1)
+        if raw:
+            # Try to find JSON in the response
+            import re as _re
+            json_match = _re.search(r'\{[^}]+\}', raw)
+            if json_match:
+                try:
+                    parsed = json.loads(json_match.group())
+                except json.JSONDecodeError:
+                    parsed = None
+
+        # Last resort: use page title as item
+        if not isinstance(parsed, dict) or "item" not in parsed:
+            if page_title or page_text:
+                item_guess = page_title or page_text[:100]
+                parsed = {
+                    "item": item_guess,
+                    "search_query": f"{item_guess} buy",
+                }
+                logger.info("Text inference fell back to page title: %s", item_guess)
+            else:
+                return None
+
+    item = parsed.get("item", "")
+    search_query = parsed.get("search_query", item)
+
+    # Build intent-aware search query from identified item
+    lower_q = user_query.lower()
+    if "near me" in lower_q or "nearby" in lower_q:
+        search_query = f"{item} restaurant near me"
+    elif "near" in lower_q:
+        search_query = f"{item} near me"
+    elif "cheap" in lower_q or "price" in lower_q or "buy" in lower_q:
+        search_query = f"{item} buy price"
+
+    results = await _ddg_search(search_query, max_results)
+    return (results, item) if results else None
 
 
-# ---------------------------------------------------------------------------
+# =====================================================================
 # MCP Tool class
-# ---------------------------------------------------------------------------
+# =====================================================================
 
 
 class ImageSimilarityTool(BaseTool):
-    """Finds visually similar products/images given a source image URL."""
+    """Finds visually similar images, products, or nearby places."""
 
     @property
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="image_similarity",
-            description="Finds visually similar images or products given a source image URL.",
+            description=(
+                "Finds visually similar images, products, or places given a "
+                "source image URL.  Supports queries like 'find places selling "
+                "this near me' or 'find similar items'."
+            ),
             parameters=[
                 ToolParameter(
                     name="image_url",
                     type="string",
                     description="URL of the source image to find similar matches for.",
+                ),
+                ToolParameter(
+                    name="query",
+                    type="string",
+                    description=(
+                        "The user's intent in natural language "
+                        "(e.g. 'find places selling this near me')."
+                    ),
+                    required=False,
+                ),
+                ToolParameter(
+                    name="page_text",
+                    type="string",
+                    description="Text from the webpage for context (used as fallback).",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="page_title",
+                    type="string",
+                    description="Title of the webpage (used as fallback).",
+                    required=False,
                 ),
                 ToolParameter(
                     name="max_results",
@@ -111,19 +381,71 @@ class ImageSimilarityTool(BaseTool):
 
     async def execute(self, **kwargs: Any) -> dict[str, Any]:
         image_url: str = kwargs.get("image_url", "")
+        user_query: str = kwargs.get("query", "find similar items")
+        page_text: str = kwargs.get("page_text", "")
+        page_title: str = kwargs.get("page_title", "")
         max_results: int = kwargs.get("max_results", 5)
 
         if not image_url or not image_url.strip():
             return {"error": "No image URL provided."}
 
-        results = _mock_similar_images(image_url, max_results)
+        # --- Strategy 1: SerpApi Google Lens ---
+        lens_results = await _serpapi_lens(image_url, max_results)
+        if lens_results:
+            return {
+                "tool": "image_similarity",
+                "source_image": image_url,
+                "results": lens_results,
+                "count": len(lens_results),
+                "method": "google_lens",
+                "identified_item": "(visual match via Google Lens)",
+            }
 
+        # --- Strategy 2: Gemini Vision → DDG ---
+        vision_result = await _gemini_vision_pipeline(
+            image_url, user_query, max_results,
+        )
+        if vision_result is not None:
+            results, item = vision_result
+            return {
+                "tool": "image_similarity",
+                "source_image": image_url,
+                "identified_item": item,
+                "results": results,
+                "count": len(results),
+                "method": "gemini_vision",
+            }
+
+        # --- Strategy 3: Text inference → DDG ---
+        text_result = await _text_inference_pipeline(
+            image_url, user_query, page_text, page_title, max_results,
+        )
+        if text_result is not None:
+            results, item = text_result
+            return {
+                "tool": "image_similarity",
+                "source_image": image_url,
+                "identified_item": item,
+                "results": results,
+                "count": len(results),
+                "method": "text_inference",
+                "note": (
+                    "Image could not be analysed directly.  Results are based "
+                    "on the page context."
+                ),
+            }
+
+        # --- All strategies failed ---
         return {
             "tool": "image_similarity",
             "source_image": image_url,
-            "results": results,
-            "count": len(results),
-            "note": "Using mock similarity engine (MVP). Swap in CLIP + vector DB for production.",
+            "results": [],
+            "count": 0,
+            "method": "none",
+            "error": (
+                "Could not analyse the image.  Make sure the image URL is "
+                "publicly accessible and try again."
+            ),
         }
 
 

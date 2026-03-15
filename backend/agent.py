@@ -183,8 +183,13 @@ cheaper", the query should be "oversized wool sweater".
 
 3. image_similarity
    - Use when the user wants to find visually similar items, matching \
-products, or "items like this".
-   - params: { "image_url": "<first image url from context>", "max_results": 5 }
+products, nearby places selling the same thing, or "items like this".
+   - params: { "image_url": "<user-selected image if available, otherwise first image url from context>", \
+"query": "<the user's full request, e.g. 'find places selling this near me'>", \
+"page_text": "<the page text from context>", \
+"page_title": "<the page title from context>", \
+"max_results": 5 }
+   - IMPORTANT: always include page_text and page_title for fallback analysis.
 
 4. generate_content
    - Use for writing tasks: study notes, emails, rewrites, summaries of a \
@@ -214,12 +219,21 @@ def _build_router_user_message(prompt: str, context: dict[str, Any]) -> str:
     images = context.get("images", [])
     images_str = ", ".join(images[:3]) if images else "(none)"
 
+    selected = context.get("selected_candidate")
+    selected_str = ""
+    if isinstance(selected, dict) and selected.get("image"):
+        selected_str = f"\nUser-selected image: {selected['image']}"
+        alt = selected.get("alt_text", "")
+        if alt and alt != "Unnamed product":
+            selected_str += f" (description: {alt})"
+
     return (
         f"User prompt: {prompt}\n\n"
         f"Page title: {title}\n"
         f"Page URL: {url}\n"
         f"Page text (first 4000 chars): {text_preview}\n"
         f"Page images: {images_str}"
+        f"{selected_str}"
     )
 
 
@@ -270,7 +284,13 @@ def _keyword_route(prompt: str, context: dict[str, Any]) -> list[dict[str, Any]]
 
     if _kw_match(p, _SIMILAR_KW):
         images = context.get("images", [])
-        plan.append({"tool": "image_similarity", "params": {"image_url": images[0] if images else "", "max_results": 5}})
+        plan.append({"tool": "image_similarity", "params": {
+            "image_url": images[0] if images else "",
+            "query": prompt,
+            "page_text": context.get("text", ""),
+            "page_title": context.get("title", ""),
+            "max_results": 5,
+        }})
 
     if _kw_match(p, _SEARCH_KW):
         title = context.get("title", "")
@@ -342,18 +362,31 @@ def _format_response(tools_used: list[str], results: list[dict[str, Any]]) -> st
         elif tool_name == "image_similarity":
             items = result.get("results", [])
             source = result.get("source_image", "")
-            text = f"🔍 Similar Items (source: {source})"
+            identified = result.get("identified_item", "")
+            method = result.get("method", "")
+            header = "🔍 Similar Items"
+            if identified:
+                header += f" — identified: {identified}"
+            if method:
+                header += f" (via {method})"
+            text = header
+            if not items:
+                text += "\n\nNo results found."
             for i, item in enumerate(items, 1):
                 title = item.get("title", "Similar item")
-                similarity = item.get("similarity", 0)
                 price = item.get("price", "")
                 url = item.get("url", "")
-                sim_str = f"{similarity:.0%}" if isinstance(similarity, (int, float)) else str(similarity)
-                line = f"\n\n{i}. {title}  —  {sim_str} match"
+                snippet = item.get("snippet", "")
+                similarity = item.get("similarity")
+                line = f"\n\n{i}. {title}"
+                if similarity and isinstance(similarity, (int, float)):
+                    line += f"  —  {similarity:.0%} match"
                 if price:
                     line += f"  —  {price}"
                 if url:
                     line += f"\n   {url}"
+                if snippet:
+                    line += f"\n   {snippet}"
                 text += line
             note = result.get("note", "")
             if note:

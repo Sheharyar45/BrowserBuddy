@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "description": "Contextual web agent extension (MVP skeleton)",
   "permissions": ["activeTab", "scripting", "storage", "tabs"],
-  "host_permissions": ["<all_urls>", "http://localhost:8000/*"],
+  "host_permissions": ["<all_urls>", "http://localhost:8000/*", "http://127.0.0.1:8000/*"],
   "action": {
     "default_popup": "popup.html"
   },

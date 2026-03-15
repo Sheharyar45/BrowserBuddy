@@ -85,6 +85,27 @@ function escapeHtml(text: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function formatAgentText(text: string): string {
+  const urlRegex = /(https?:\/\/[^\s]+)/g;
+  const parts = text.split(urlRegex);
+  return parts
+    .map((part, i) => {
+      if (i % 2 === 1) {
+        let url = part;
+        const trailingMatch = url.match(/([.,;:!?)]+)$/);
+        let trailing = "";
+        if (trailingMatch) {
+          trailing = trailingMatch[1];
+          url = url.slice(0, -trailing.length);
+        }
+        const display = url.length > 60 ? url.slice(0, 57) + "..." : url;
+        return `<a href="${escapeHtml(url)}" target="_blank" rel="noopener noreferrer" style="color:#2563eb;word-break:break-all;text-decoration:underline;">${escapeHtml(display)}</a>${escapeHtml(trailing)}`;
+      }
+      return escapeHtml(part).replace(/\n/g, "<br>");
+    })
+    .join("");
+}
+
 function appendMessage(sender: "User" | "Agent", text: string): void {
   const line = document.createElement("div");
   line.style.marginBottom = "10px";
@@ -96,7 +117,8 @@ function appendMessage(sender: "User" | "Agent", text: string): void {
   line.style.boxShadow = "0 3px 10px rgba(59,130,246,0.08)";
   line.style.whiteSpace = "pre-wrap";
   line.style.wordBreak = "break-word";
-  line.innerHTML = `<strong>${sender}:</strong> ${escapeHtml(text).replace(/\n/g, "<br>")}`;
+  const formatted = sender === "Agent" ? formatAgentText(text) : escapeHtml(text).replace(/\n/g, "<br>");
+  line.innerHTML = `<strong>${sender}:</strong> ${formatted}`;
   chatEl.appendChild(line);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -357,6 +379,117 @@ function getStoredContext(sessionId: string): Promise<StoredContextResponse> {
   });
 }
 
+let loadingEl: HTMLDivElement | null = null;
+
+function showLoading(): void {
+  hideLoading();
+  loadingEl = document.createElement("div");
+  loadingEl.style.cssText =
+    "margin-bottom:10px;padding:12px;border-radius:10px;border:1px dashed #93c5fd;" +
+    "background:#f0f7ff;color:#64748b;font-size:12px;text-align:center;";
+  loadingEl.textContent = "Thinking\u2026";
+  chatEl.appendChild(loadingEl);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function hideLoading(): void {
+  if (loadingEl) {
+    loadingEl.remove();
+    loadingEl = null;
+  }
+}
+
+function appendToolCard(toolName: string, data: any): void {
+  if (!data) return;
+  if (data?.error && !data?.results?.length) {
+    appendMessage("Agent", `Error (${toolName}): ${data.error}`);
+    return;
+  }
+
+  const card = document.createElement("div");
+  card.style.cssText =
+    "margin-bottom:10px;padding:10px;border-radius:10px;border:1px solid #d7ebff;" +
+    "background:#ffffff;box-shadow:0 3px 10px rgba(59,130,246,0.08);font-size:12px;color:#0f172a;";
+
+  if (toolName === "image_similarity") {
+    const identified = data.identified_item || "Similar Items";
+    const method = data.method || "";
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDD0D ${escapeHtml(identified)}`;
+    if (method)
+      html += ` <span style="font-size:10px;font-weight:400;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px;">${escapeHtml(method)}</span>`;
+    html += `</div>`;
+    const items: any[] = data.results || [];
+    if (!items.length) html += `<div style="color:#94a3b8;">No similar items found.</div>`;
+    for (const item of items) {
+      html += `<div style="padding:6px 0;border-top:1px solid #f0f4f8;">`;
+      html += item.url
+        ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener" style="color:#2563eb;font-weight:600;font-size:12px;text-decoration:none;">${escapeHtml(item.title || "Result")}</a>`
+        : `<div style="font-weight:600;">${escapeHtml(item.title || "Result")}</div>`;
+      if (item.price)
+        html += ` <span style="color:#059669;font-weight:600;font-size:11px;">${escapeHtml(String(item.price))}</span>`;
+      if (item.snippet)
+        html += `<div style="color:#64748b;font-size:11px;margin-top:2px;line-height:1.4;">${escapeHtml(String(item.snippet).slice(0, 150))}</div>`;
+      html += `</div>`;
+    }
+    if (data.note)
+      html += `<div style="color:#94a3b8;font-size:10px;margin-top:6px;font-style:italic;">${escapeHtml(data.note)}</div>`;
+    card.innerHTML = html;
+
+  } else if (toolName === "shopping_search") {
+    const query = data.query || "Products";
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDED2 ${escapeHtml(query)}</div>`;
+    const items: any[] = data.results || [];
+    if (!items.length) html += `<div style="color:#94a3b8;">No results found.</div>`;
+    for (const item of items) {
+      html += `<div style="padding:6px 0;border-top:1px solid #f0f4f8;">`;
+      html += item.url
+        ? `<a href="${escapeHtml(item.url)}" target="_blank" rel="noopener" style="color:#2563eb;font-weight:600;font-size:12px;text-decoration:none;">${escapeHtml(item.title || "Product")}</a>`
+        : `<div style="font-weight:600;">${escapeHtml(item.title || "Product")}</div>`;
+      if (item.price)
+        html += ` <span style="display:inline-block;color:#059669;font-weight:700;font-size:11px;background:#ecfdf5;padding:1px 5px;border-radius:4px;margin-top:2px;">${escapeHtml(String(item.price))}</span>`;
+      if (item.snippet)
+        html += `<div style="color:#64748b;font-size:11px;margin-top:2px;line-height:1.4;">${escapeHtml(String(item.snippet).slice(0, 150))}</div>`;
+      html += `</div>`;
+    }
+    if (data.note)
+      html += `<div style="color:#94a3b8;font-size:10px;margin-top:6px;font-style:italic;">${escapeHtml(data.note)}</div>`;
+    card.innerHTML = html;
+
+  } else if (toolName === "summarize_page") {
+    const summary = data.summary || "";
+    const keyPoints: string[] = data.key_points || [];
+    const method = data.method || "";
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\uD83D\uDCDD Summary`;
+    if (method)
+      html += ` <span style="font-size:10px;font-weight:400;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px;">${escapeHtml(method)}</span>`;
+    html += `</div>`;
+    html += `<div style="color:#0f172a;line-height:1.5;white-space:pre-wrap;">${formatAgentText(summary)}</div>`;
+    if (keyPoints.length) {
+      html += `<div style="margin-top:8px;font-weight:600;color:#0b3a66;font-size:11px;">Key Points:</div>`;
+      for (const kp of keyPoints) {
+        html += `<div style="color:#334155;font-size:11px;line-height:1.4;padding-left:8px;">\u2022 ${escapeHtml(kp)}</div>`;
+      }
+    }
+    card.innerHTML = html;
+
+  } else if (toolName === "generate_content") {
+    const content = data.content || "";
+    const method = data.method || "";
+    let html = `<div style="font-weight:700;color:#0b3a66;font-size:13px;margin-bottom:8px;">\u270D\uFE0F Generated`;
+    if (method)
+      html += ` <span style="font-size:10px;font-weight:400;color:#64748b;background:#f1f5f9;padding:2px 6px;border-radius:4px;">${escapeHtml(method)}</span>`;
+    html += `</div>`;
+    html += `<div style="color:#0f172a;line-height:1.5;white-space:pre-wrap;font-size:12px;">${formatAgentText(content)}</div>`;
+    card.innerHTML = html;
+
+  } else {
+    card.innerHTML = `<div style="white-space:pre-wrap;">${formatAgentText(JSON.stringify(data, null, 2))}</div>`;
+  }
+
+  chatEl.appendChild(card);
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
 appendMessage(
   "Agent",
   hasChromeRuntime
@@ -370,9 +503,7 @@ function shouldRefreshContextForPrompt(prompt: string): boolean {
     return false;
   }
 
-  // Refresh context when user likely asks for product/similarity actions,
-  // so new mouse-selected candidate reaches backend even in existing session.
-  return /(cheaper|price|buy|purchase|shop|deal|discount|alternative|similar|like this|match|same style|find this)/i.test(p);
+  return /(cheaper|price|buy|purchase|shop|deal|discount|alternative|similar|like this|match|same style|find this|near me|nearby|places)/i.test(p);
 }
 
 sendBtn.addEventListener("click", async () => {
@@ -384,13 +515,12 @@ sendBtn.addEventListener("click", async () => {
   appendMessage("User", prompt);
   promptEl.value = "";
   sendBtn.disabled = true;
+  showLoading();
 
   try {
     const tab = await getCurrentTab();
     const tabUrl = tab.url || null;
 
-    // If the user navigated to a different page while the popup is open,
-    // start a fresh session so we don't reuse the wrong stored context.
     if (lastSessionId && lastTabUrl && tabUrl && tabUrl !== lastTabUrl) {
       lastSessionId = null;
     }
@@ -403,22 +533,40 @@ sendBtn.addEventListener("click", async () => {
       result = await queryAgent({ prompt, context, session_id: lastSessionId || undefined });
     }
 
+    hideLoading();
     lastSessionId = result.session_id || null;
     lastTabUrl = tabUrl;
 
-    // Show tool badges if available
-    if (result.tools_used && result.tools_used.length > 0) {
-      const toolBadges = result.tools_used.map((t: string) => `[${t}]`).join(" ");
-      appendMessage("Agent", `Tools used: ${toolBadges}`);
-    }
+    // Render structured tool cards when available; fall back to text.
+    const hasCards =
+      Array.isArray(result.tool_results) &&
+      result.tool_results.length > 0 &&
+      Array.isArray(result.tools_used) &&
+      result.tools_used.length > 0 &&
+      result.tool_results.some((r: any) => r && !r.error);
 
-    appendMessage("Agent", result.response || "No response received.");
-    appendContextDebug(result);
+    if (hasCards) {
+      const tools = result.tools_used!;
+      const results = result.tool_results!;
+      for (let i = 0; i < tools.length; i++) {
+        appendToolCard(tools[i], results[i]);
+      }
+    } else {
+      appendMessage("Agent", result.response || "No response received.");
+    }
   } catch (error) {
+    hideLoading();
     const message = error instanceof Error ? error.message : "Unexpected error";
     appendMessage("Agent", `Error: ${message}`);
   } finally {
     sendBtn.disabled = false;
+  }
+});
+
+promptEl.addEventListener("keydown", (e: KeyboardEvent) => {
+  if (e.key === "Enter" && !e.shiftKey) {
+    e.preventDefault();
+    sendBtn.click();
   }
 });
 
