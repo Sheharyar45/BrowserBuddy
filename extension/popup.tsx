@@ -22,6 +22,8 @@ type AgentResponse = {
     stored_image_count?: number;
   };
   response: string;
+  tools_used?: string[];
+  tool_results?: any[];
 };
 
 type StoredContextResponse = {
@@ -60,6 +62,14 @@ const sendBtn = document.getElementById("send") as HTMLButtonElement;
 const viewContextBtn = document.getElementById("viewContext") as HTMLButtonElement;
 let lastSessionId: string | null = null;
 
+function escapeHtml(text: string): string {
+  return text
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
 function appendMessage(sender: "User" | "Agent", text: string): void {
   const line = document.createElement("div");
   line.style.marginBottom = "10px";
@@ -69,7 +79,9 @@ function appendMessage(sender: "User" | "Agent", text: string): void {
   line.style.background = sender === "User" ? "#eaf5ff" : "#ffffff";
   line.style.color = "#0f172a";
   line.style.boxShadow = "0 3px 10px rgba(59,130,246,0.08)";
-  line.innerHTML = `<strong>${sender}:</strong> ${text}`;
+  line.style.whiteSpace = "pre-wrap";
+  line.style.wordBreak = "break-word";
+  line.innerHTML = `<strong>${sender}:</strong> ${escapeHtml(text).replace(/\n/g, "<br>")}`;
   chatEl.appendChild(line);
   chatEl.scrollTop = chatEl.scrollHeight;
 }
@@ -283,6 +295,13 @@ sendBtn.addEventListener("click", async () => {
     const context = await requestPageContext(tab.id as number);
     const result = await queryAgent(prompt, context);
     lastSessionId = result.session_id || null;
+
+    // Show tool badges if available
+    if (result.tools_used && result.tools_used.length > 0) {
+      const toolBadges = result.tools_used.map((t: string) => `[${t}]`).join(" ");
+      appendMessage("Agent", `Tools used: ${toolBadges}`);
+    }
+
     appendMessage("Agent", result.response || "No response received.");
     appendContextDebug(result);
   } catch (error) {
