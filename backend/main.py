@@ -7,8 +7,13 @@ from pydantic import BaseModel, Field
 
 from agent import run_agent
 from context_store import get_context, save_context
+from tools import get_registry
 
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+)
 logger = logging.getLogger("browserbuddy.backend")
 
 
@@ -53,11 +58,8 @@ async def query_agent(data: AgentQueryRequest) -> dict:
 
     session_id = data.session_id or str(uuid4())
     context_payload = data.context.model_dump()
-    try:
-        save_context(session_id, context_payload)
-        stored_context = get_context(session_id) or {}
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    save_context(session_id, context_payload)
+    stored_context = get_context(session_id) or {}
 
     logger.info(
         "Stored context for session=%s title=%s text_chars=%s image_count=%s",
@@ -67,10 +69,14 @@ async def query_agent(data: AgentQueryRequest) -> dict:
         len(stored_context.get("images") or []),
     )
 
-    result = await run_agent(data.prompt, context_payload)
+    agent_result = await run_agent(data.prompt, context_payload)
 
     return {
         "session_id": session_id,
+        "response": agent_result.get("response", ""),
+        "tools_used": agent_result.get("tools_used", []),
+        "tool_results": agent_result.get("tool_results", []),
+        "routing_method": agent_result.get("routing_method", "unknown"),
         "received_context": {
             "url": data.context.url,
             "title": data.context.title,
@@ -86,16 +92,12 @@ async def query_agent(data: AgentQueryRequest) -> dict:
             "has_images": len(stored_context.get("images") or []) > 0,
             "stored_image_count": len(stored_context.get("images") or []),
         },
-        "response": result,
     }
 
 
 @app.get("/context/{session_id}")
 async def read_context(session_id: str) -> dict:
-    try:
-        context = get_context(session_id)
-    except RuntimeError as exc:
-        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    context = get_context(session_id)
     if context is None:
         raise HTTPException(status_code=404, detail="Session context not found")
 
@@ -107,3 +109,13 @@ async def read_context(session_id: str) -> dict:
     )
 
     return {"session_id": session_id, "context": context}
+
+
+@app.get("/tools")
+async def list_tools() -> dict:
+    """List all registered MCP tools and their definitions."""
+    reg = get_registry()
+    return {
+        "tools": [t.to_dict() for t in reg.list_tools()],
+        "count": len(reg.list_tools()),
+    }
