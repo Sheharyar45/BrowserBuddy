@@ -29,8 +29,14 @@ SAMPLE_CONTEXT = {
 }
 
 
-def post_query(prompt: str) -> dict:
-    payload = json.dumps({"prompt": prompt, "context": SAMPLE_CONTEXT}).encode()
+def post_query(prompt: str, *, session_id: str | None = None, include_context: bool = True) -> dict:
+    body: dict = {"prompt": prompt}
+    if session_id:
+        body["session_id"] = session_id
+    if include_context:
+        body["context"] = SAMPLE_CONTEXT
+
+    payload = json.dumps(body).encode()
     req = urllib.request.Request(
         f"{BASE}/agent/query",
         data=payload,
@@ -70,6 +76,16 @@ def main() -> None:
     print(f"  Tools used: {result.get('tools_used')}")
     print(f"  Response preview: {result['response'][:300]}...")
 
+    # 3b. Test: session reuse without resending context
+    separator("Test: Reuse session_id (no context)")
+    session_id = result.get("session_id")
+    if not session_id:
+        raise RuntimeError("Expected session_id from backend")
+    result2 = post_query("Summarize again in one sentence", session_id=session_id, include_context=False)
+    print(f"  Session: {result2.get('session_id')}")
+    print(f"  Context source: {result2.get('context_source')}")
+    print(f"  Response preview: {result2['response'][:200]}...")
+
     # 4. Test: shopping search
     separator("Test: Find cheaper alternatives")
     result = post_query("Find cheaper alternatives")
@@ -107,7 +123,6 @@ def main() -> None:
 
     # 9. Verify context storage
     separator("Context Storage Check")
-    session_id = result.get("session_id")
     if session_id:
         ctx = get_json(f"/context/{session_id}")
         print(f"  Session: {ctx['session_id']}")
