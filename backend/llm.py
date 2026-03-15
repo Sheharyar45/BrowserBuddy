@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any
 
 import httpx
@@ -180,22 +181,98 @@ async def llm_json(
     """
 
     raw = await llm_chat(messages, max_tokens, temperature)
+    print("LLM raw response for JSON parsing:", raw[:500] if raw else "None")
     if raw is None:
         return None
 
-    # Strip code fences
-    text = raw.strip()
-    if text.startswith("```"):
-        # Remove opening ```json or ``` and closing ```
-        lines = text.split("\n")
-        if lines[0].startswith("```"):
-            lines = lines[1:]
-        if lines and lines[-1].strip() == "```":
-            lines = lines[:-1]
-        text = "\n".join(lines).strip()
+    def _strip_code_fences(value: str) -> str:
+        text = value.strip()
+        if text.startswith("```"):
+            lines = text.split("\n")
+            if lines and lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            text = "\n".join(lines).strip()
+        return text
 
+    def _extract_first_json_object(value: str) -> str | None:
+        start = value.find("{")
+        if start == -1:
+            return None
+
+        depth = 0
+        in_string = False
+        escaping = False
+        for idx in range(start, len(value)):
+            ch = value[idx]
+
+            if escaping:
+                escaping = False
+                continue
+
+            if ch == "\\":
+                escaping = True
+                continue
+
+            if ch == '"':
+                in_string = not in_string
+                continue
+
+            if in_string:
+                continue
+
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return value[start: idx + 1]
+
+        return None
+
+    text = _strip_code_fences(raw)
+
+    # Pass 1: direct parse
     try:
         return json.loads(text)
-    except json.JSONDecodeError as exc:
-        logger.warning("Failed to parse LLM response as JSON: %s — raw: %s", exc, text[:200])
+    except json.JSONDecodeError:
+        pass
+
+    # Pass 2: try extracting first JSON object from mixed prose output
+    extracted = _extract_first_json_object(text)
+    if extracted:
+        try:
+            return json.loads(extracted)
+        except json.JSONDecodeError:
+            pass
+
+    logger.warning("Failed to parse LLM response as JSON on first pass — raw: %s", text[:240])
+
+    # Pass 3: single strict retry asking model to output only JSON.
+    retry_messages = messages + [
+        {
+            "role": "user",
+            "content": (
+                "Your previous response was not valid JSON. "
+                "Return ONLY valid JSON (no markdown, no explanation, no extra text)."
+            ),
+        }
+    ]
+    retry_raw = await llm_chat(retry_messages, max_tokens=max_tokens, temperature=0.0)
+    if retry_raw is None:
         return None
+
+    retry_text = _strip_code_fences(retry_raw)
+    try:
+        return json.loads(retry_text)
+    except json.JSONDecodeError:
+        extracted_retry = _extract_first_json_object(retry_text)
+        if extracted_retry:
+            try:
+                return json.loads(extracted_retry)
+            except json.JSONDecodeError:
+                pass
+
+    logger.warning("Failed to parse LLM response as JSON after retry — raw: %s", retry_text[:240])
+    return None
